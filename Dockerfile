@@ -1,101 +1,35 @@
-# Academick - Laravel/React Production Dockerfile
+FROM unit:1.34.1-php8.3
 
-# -----------------------------------------------------------------------------
-# Stage 1: Frontend Asset Builder (Node.js)
-#
-# This stage uses Node.js to install npm dependencies and build the
-# production-ready frontend assets using Vite.
-# -----------------------------------------------------------------------------
-FROM node:20-alpine AS node-builder
+RUN apt update && apt install -y \
+    curl unzip git libicu-dev libzip-dev libpng-dev libjpeg-dev libfreetype6-dev libssl-dev \
+    && docker-php-ext-configure gd --with-freetype --with-jpeg \
+    && docker-php-ext-install -j$(nproc) pcntl opcache pdo pdo_mysql intl zip gd exif ftp bcmath \
+    && pecl install redis \
+    && docker-php-ext-enable redis
 
-WORKDIR /app
+RUN echo "opcache.enable=1" > /usr/local/etc/php/conf.d/custom.ini \
+    && echo "opcache.jit=tracing" >> /usr/local/etc/php/conf.d/custom.ini \
+    && echo "opcache.jit_buffer_size=256M" >> /usr/local/etc/php/conf.d/custom.ini \
+    && echo "memory_limit=512M" > /usr/local/etc/php/conf.d/custom.ini \        
+    && echo "upload_max_filesize=64M" >> /usr/local/etc/php/conf.d/custom.ini \
+    && echo "post_max_size=64M" >> /usr/local/etc/php/conf.d/custom.ini
 
-# Copy package manifests to leverage Docker layer caching.
-# This step only re-runs if package.json or package-lock.json changes.
-COPY package.json package-lock.json ./
-
-# Install npm dependencies using 'ci' for a clean, reproducible install.
-# Based on the presence of package-lock.json.
-RUN npm ci
-
-# Copy the rest of the project files.
-COPY . .
-
-# Build the frontend assets for production.
-# The output is expected in the 'public/build' directory for Laravel with Vite.
-RUN npm run build
-
-# -----------------------------------------------------------------------------
-# Stage 2: Backend Dependency Builder (Composer)
-#
-# This stage installs PHP dependencies using Composer. It creates a 'vendor'
-# directory that will be copied to the final image.
-# -----------------------------------------------------------------------------
-FROM composer:2 AS composer-vendor
-
-WORKDIR /app
-
-# Copy Composer manifests to leverage Docker layer caching.
-COPY composer.json composer.lock ./
-
-# Install production dependencies without dev packages and with an optimized autoloader.
-RUN composer install --no-dev --optimize-autoloader --no-interaction
-
-# Copy the full application source code.
-COPY . .
-
-# -----------------------------------------------------------------------------
-# Stage 3: Final Production Image (PHP-FPM)
-#
-# This is the final, optimized image that will run the application.
-# It uses PHP-FPM and copies artifacts from the previous stages.
-# -----------------------------------------------------------------------------
-FROM php:8.3-fpm-alpine
+COPY --from=composer:latest /usr/bin/composer /usr/local/bin/composer
 
 WORKDIR /var/www/html
 
-# Install required system packages and PHP extensions for Laravel.
-# We create a virtual package `.build-deps` for build-time dependencies,
-# install extensions, and then remove the virtual package to keep the image small.
-RUN apk add --no-cache --virtual .build-deps \
-        $PHPIZE_DEPS \
-        libzip-dev \
-        libpng-dev \
-        jpeg-dev \
-        freetype-dev \
-    && apk add --no-cache \
-        zip \
-    && docker-php-ext-configure gd --with-freetype --with-jpeg \
-    && docker-php-ext-install -j$(nproc) \
-        pdo_mysql \
-        mbstring \
-        exif \
-        pcntl \
-        bcmath \
-        gd \
-        zip \
-    && pecl install redis && docker-php-ext-enable redis \
-    && apk del .build-deps
+RUN mkdir -p /var/www/html/storage /var/www/html/bootstrap/cache
 
-# Copy the application code and Composer dependencies from the 'composer-vendor' stage.
-COPY --from=composer-vendor /app .
+RUN chown -R unit:unit /var/www/html/storage bootstrap/cache && chmod -R 775 /var/www/html/storage
 
-# Copy the compiled frontend assets from the 'node-builder' stage.
-COPY --from=node-builder /app/public/build ./public/build
+COPY . .
 
-# Set the correct ownership and permissions for Laravel's storage and cache directories.
-# This allows the web server user (www-data) to write logs and cache files.
-RUN chown -R www-data:www-data /var/www/html/storage /var/www/html/bootstrap/cache \
-    && chmod -R 755 /var/www/html/storage /var/www/html/bootstrap/cache
+RUN chown -R unit:unit storage bootstrap/cache && chmod -R 775 storage bootstrap/cache
 
-# --- Production Usage Note ---
-# This image exposes PHP-FPM on port 9000. It does not include a web server.
-# For production, you should run a separate web server container (e.g., nginx)
-# and configure it to proxy HTTP requests to this container on port 9000.
-# -----------------------------
+RUN composer install --prefer-dist --optimize-autoloader --no-interaction
 
-# Expose port 9000 to the host/network.
-EXPOSE 9000
+COPY unit.json /docker-entrypoint.d/unit.json
 
-# The main command to run when the container starts.
-CMD ["php-fpm"]
+EXPOSE 8000
+
+CMD ["unitd", "--no-daemon"]
